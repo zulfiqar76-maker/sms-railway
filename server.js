@@ -1,157 +1,102 @@
 const express = require('express');
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─────────────────────────────────────────────
-//  CONFIGURATION — Change SECRET_KEY
-// ─────────────────────────────────────────────
-const SECRET_KEY   = process.env.SECRET_KEY   || '0241';
-const LOGIN_PASS   = process.env.LOGIN_PASS   || 'admin123';
-const PORT         = process.env.PORT         || 3000;
-const DB_PATH      = process.env.DB_PATH      || './sms_gateway.db';
-// ─────────────────────────────────────────────
+const SECRET_KEY = process.env.SECRET_KEY || '0241';
+const LOGIN_PASS = process.env.LOGIN_PASS || 'admin123';
+const PORT       = process.env.PORT       || 3000;
+const DB_FILE    = path.join(__dirname, 'db.json');
 
-// Initialize SQLite database
-const db = new Database(DB_PATH);
+function readDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch(e) {}
+  return { messages: [], nextId: 1 };
+}
 
-// Create table if not exists
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sms_queue (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone_to  TEXT NOT NULL,
-    message   TEXT NOT NULL,
-    status    TEXT DEFAULT 'pending',
-    created   DATETIME DEFAULT CURRENT_TIMESTAMP,
-    sent_at   DATETIME NULL
-  )
-`);
+function writeDB(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
 
-// Allow CORS for all requests
+function now() {
+  return new Date().toISOString().replace('T', ' ').substring(0, 19);
+}
+
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
   next();
 });
 
-// Serve static files (web pages)
-app.use(express.static('public'));
-
-// ═══════════════════════════════════════════
-//  API — For Android App
-// ═══════════════════════════════════════════
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/sms_gateway.php', (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-
-  const action = req.query.action || '';
-  const key    = req.query.key    || '';
-
-  // Validate secret key
-  if (key !== SECRET_KEY) {
-    return res.json({ status: 'error', message: 'Invalid secret key' });
-  }
-
-  // Get pending messages
+  const { action, key } = req.query;
+  if (key !== SECRET_KEY) return res.json({ status: 'error', message: 'Invalid key' });
+  const db = readDB();
   if (action === 'pending') {
-    const messages = db.prepare(
-      "SELECT id, phone_to AS 'to', message AS text FROM sms_queue WHERE status='pending' ORDER BY created ASC LIMIT 10"
-    ).all();
+    const messages = db.messages.filter(m => m.status === 'pending').slice(0,10)
+      .map(m => ({ id: m.id, to: m.phone_to, text: m.message }));
     return res.json({ status: 'ok', messages });
   }
-
-  // Mark message as sent/failed
   if (action === 'update') {
-    const id     = parseInt(req.query.id || 0);
-    const status = ['sent', 'failed'].includes(req.query.status) ? req.query.status : 'sent';
-    db.prepare("UPDATE sms_queue SET status=?, sent_at=CURRENT_TIMESTAMP WHERE id=?").run(status, id);
+    const id = parseInt(req.query.id || 0);
+    const status = ['sent','failed'].includes(req.query.status) ? req.query.status : 'sent';
+    const msg = db.messages.find(m => m.id === id);
+    if (msg) { msg.status = status; msg.sent_at = now(); writeDB(db); }
     return res.json({ status: 'ok', updated: id });
   }
-
-  return res.json({ status: 'error', message: 'Unknown action' });
+  res.json({ status: 'error', message: 'Unknown action' });
 });
 
-// ═══════════════════════════════════════════
-//  WEB PAGES API
-// ═══════════════════════════════════════════
-
-// Login check
 app.post('/api/login', (req, res) => {
-  const { password } = req.body;
-  if (password === LOGIN_PASS) {
-    res.json({ status: 'ok' });
-  } else {
-    res.json({ status: 'error', message: 'Wrong password' });
-  }
+  res.json(req.body.password === LOGIN_PASS ? { status: 'ok' } : { status: 'error', message: 'Wrong password' });
 });
 
-// Get dashboard stats
 app.get('/api/stats', (req, res) => {
-  const key = req.query.key || '';
-  if (key !== SECRET_KEY) return res.json({ status: 'error' });
-
-  const total   = db.prepare("SELECT COUNT(*) as c FROM sms_queue").get().c;
-  const pending = db.prepare("SELECT COUNT(*) as c FROM sms_queue WHERE status='pending'").get().c;
-  const sent    = db.prepare("SELECT COUNT(*) as c FROM sms_queue WHERE status='sent'").get().c;
-  const failed  = db.prepare("SELECT COUNT(*) as c FROM sms_queue WHERE status='failed'").get().c;
-
-  res.json({ status: 'ok', total, pending, sent, failed });
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
+  const db = readDB();
+  res.json({ status: 'ok', total: db.messages.length,
+    pending: db.messages.filter(m => m.status==='pending').length,
+    sent:    db.messages.filter(m => m.status==='sent').length,
+    failed:  db.messages.filter(m => m.status==='failed').length });
 });
 
-// Send new SMS (from web page)
 app.post('/api/send', (req, res) => {
   const { key, phone, message } = req.body;
   if (key !== SECRET_KEY) return res.json({ status: 'error', message: 'Invalid key' });
-  if (!phone || !message) return res.json({ status: 'error', message: 'Phone and message required' });
-
-  const result = db.prepare(
-    "INSERT INTO sms_queue (phone_to, message, status) VALUES (?, ?, 'pending')"
-  ).run(phone, message);
-
-  res.json({ status: 'ok', id: result.lastInsertRowid });
+  if (!phone || !message) return res.json({ status: 'error', message: 'Fill all fields' });
+  const db = readDB();
+  const id = db.nextId++;
+  db.messages.push({ id, phone_to: phone, message, status: 'pending', created: now(), sent_at: null });
+  writeDB(db);
+  res.json({ status: 'ok', id });
 });
 
-// Get message history
 app.get('/api/history', (req, res) => {
-  const key    = req.query.key    || '';
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
+  const page = parseInt(req.query.page || 1);
   const filter = req.query.filter || 'all';
-  const page   = parseInt(req.query.page || 1);
-  const limit  = 20;
-  const offset = (page - 1) * limit;
-
-  if (key !== SECRET_KEY) return res.json({ status: 'error' });
-
-  let where = filter !== 'all' ? `WHERE status='${filter}'` : '';
-  const messages = db.prepare(
-    `SELECT * FROM sms_queue ${where} ORDER BY created DESC LIMIT ${limit} OFFSET ${offset}`
-  ).all();
-  const total = db.prepare(`SELECT COUNT(*) as c FROM sms_queue ${where}`).get().c;
-
-  res.json({ status: 'ok', messages, total });
+  const db = readDB();
+  let msgs = db.messages.slice().reverse();
+  if (filter !== 'all') msgs = msgs.filter(m => m.status === filter);
+  res.json({ status: 'ok', messages: msgs.slice((page-1)*20, page*20), total: msgs.length });
 });
 
-// Delete message
 app.get('/api/delete', (req, res) => {
-  const key = req.query.key || '';
-  const id  = req.query.id  || '';
-  if (key !== SECRET_KEY) return res.json({ status: 'error' });
-
-  if (id === 'all')    db.exec("DELETE FROM sms_queue");
-  else if (id === 'sent')   db.exec("DELETE FROM sms_queue WHERE status='sent'");
-  else if (id === 'failed') db.exec("DELETE FROM sms_queue WHERE status='failed'");
-  else db.prepare("DELETE FROM sms_queue WHERE id=?").run(parseInt(id));
-
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
+  const id = req.query.id || '';
+  const db = readDB();
+  if      (id === 'all')    db.messages = [];
+  else if (id === 'sent')   db.messages = db.messages.filter(m => m.status !== 'sent');
+  else if (id === 'failed') db.messages = db.messages.filter(m => m.status !== 'failed');
+  else                      db.messages = db.messages.filter(m => m.id !== parseInt(id));
+  writeDB(db);
   res.json({ status: 'ok' });
 });
 
-// ═══════════════════════════════════════════
-//  START SERVER
-// ═══════════════════════════════════════════
-app.listen(PORT, () => {
-  console.log(`✅ SMS Gateway running on port ${PORT}`);
-  console.log(`🔑 Secret Key: ${SECRET_KEY}`);
-});
+app.listen(PORT, () => console.log(`SMS Gateway on port ${PORT}`));
