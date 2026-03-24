@@ -139,6 +139,24 @@
   .filter-bar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
   .filter-bar select, .filter-bar input { flex:1; min-width:150px; }
   .del-btns { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+
+  /* MODAL */
+  .modal-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55);
+    z-index:999; align-items:center; justify-content:center;
+  }
+  .modal-overlay.open { display:flex; }
+  .modal-box {
+    background:white; border-radius:18px; padding:30px;
+    width:100%; max-width:450px; box-shadow:0 20px 60px rgba(0,0,0,0.3);
+    animation:popIn .2s ease;
+  }
+  @keyframes popIn { from{transform:scale(.9);opacity:0} to{transform:scale(1);opacity:1} }
+  .modal-title { font-size:17px; font-weight:700; color:#1A237E; margin-bottom:16px; }
+  .modal-footer { display:flex; gap:10px; margin-top:18px; }
+  .btn-success { background:linear-gradient(135deg,#11998e,#38ef7d); color:white; flex:1; justify-content:center; }
+  .btn-cancel  { background:#eee; color:#444; flex:1; justify-content:center; }
+  .btn-edit    { background:linear-gradient(135deg,#667eea,#764ba2); color:white; font-size:12px; padding:6px 12px; margin:3px; }
 </style>
 </head>
 <body>
@@ -245,7 +263,7 @@
         </div>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>#</th><th>📞 Phone</th><th>💬 Message</th><th>Status</th><th>🕐 Time</th><th>⚙️</th></tr></thead>
+            <thead><tr><th>#</th><th>📞 Phone</th><th>💬 Message</th><th>Status</th><th>🕐 Time</th><th>⚙️ Actions</th></tr></thead>
             <tbody id="hist-body"><tr><td colspan="6" style="text-align:center;padding:30px;color:#888;">Loading...</td></tr></tbody>
           </table>
         </div>
@@ -253,6 +271,24 @@
       </div>
     </div>
 
+  </div>
+</div>
+
+<!-- ══ EDIT MODAL ══ -->
+<div class="modal-overlay" id="editModal">
+  <div class="modal-box">
+    <div class="modal-title">✏️ Edit Message</div>
+    <div id="edit-alert"></div>
+    <input type="hidden" id="edit-id">
+    <label>📞 Phone Number</label>
+    <input type="tel" id="edit-phone" placeholder="+923001234567">
+    <label>💬 Message</label>
+    <textarea id="edit-msg" placeholder="پیغام یہاں لکھیں..." style="height:100px;"></textarea>
+    <div class="char-count"><span id="edit-char-count">0</span>/160 chars</div>
+    <div class="modal-footer">
+      <button class="btn btn-cancel" onclick="closeEditModal()">✖️ Cancel</button>
+      <button class="btn btn-success" onclick="saveEdit()">💾 Save Changes</button>
+    </div>
   </div>
 </div>
 
@@ -385,7 +421,10 @@ async function loadHistory(page=1) {
       <td style="max-width:200px;word-break:break-word;font-size:12px;">${m.message}</td>
       <td><span class="badge b-${m.status}">${icons[m.status]||''} ${m.status.toUpperCase()}</span></td>
       <td style="font-size:11px;color:#888;">${m.created}</td>
-      <td><button class="btn btn-danger" onclick="delOne(${m.id})">🗑️</button></td>
+      <td>
+        <button class="btn btn-edit" onclick="openEditModal(${m.id}, \`${m.phone_to.replace(/`/g,'\\`')}\`, \`${m.message.replace(/`/g,'\\`').replace(/\n/g,'\\n')}\`)">✏️</button>
+        <button class="btn btn-danger" onclick="delOne(${m.id})">🗑️</button>
+      </td>
     </tr>
   `).join('');
 
@@ -409,6 +448,57 @@ async function delOne(id) {
   if (!confirm('Delete this message?')) return;
   await fetch(`/api/delete?key=${SECRET_KEY}&id=${id}`);
   loadHistory(currentPage);
+}
+
+// ── EDIT MODAL ───────────────────────────────
+function openEditModal(id, phone, message) {
+  document.getElementById('edit-id').value    = id;
+  document.getElementById('edit-phone').value = phone;
+  document.getElementById('edit-msg').value   = message;
+  document.getElementById('edit-char-count').textContent = message.length;
+  document.getElementById('edit-alert').innerHTML = '';
+  document.getElementById('editModal').classList.add('open');
+}
+
+function closeEditModal() {
+  document.getElementById('editModal').classList.remove('open');
+}
+
+document.getElementById('edit-msg').addEventListener('input', function() {
+  document.getElementById('edit-char-count').textContent = this.value.length;
+});
+
+// Close modal on overlay click
+document.getElementById('editModal').addEventListener('click', function(e) {
+  if (e.target === this) closeEditModal();
+});
+
+async function saveEdit() {
+  const id      = document.getElementById('edit-id').value;
+  const phone   = document.getElementById('edit-phone').value.trim();
+  const message = document.getElementById('edit-msg').value.trim();
+  const alertEl = document.getElementById('edit-alert');
+
+  if (!phone || !message) {
+    alertEl.className = 'alert alert-err';
+    alertEl.textContent = '❌ Please fill all fields!';
+    return;
+  }
+
+  const res  = await fetch('/api/edit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: SECRET_KEY, id, phone, message })
+  });
+  const data = await res.json();
+
+  if (data.status === 'ok') {
+    closeEditModal();
+    loadHistory(currentPage);
+    loadStats();
+  } else {
+    alertEl.className = 'alert alert-err';
+    alertEl.textContent = '❌ Error: ' + data.message;
+  }
 }
 
 async function delMsgs(type) {
