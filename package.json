@@ -1,15 +1,8 @@
 {
   "name": "sms-gateway-api",
   "version": "3.0.0",
-  "description": "SMS Gateway — proxies Android app to PHP API on shared hosting",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.18.2" },
+  "engines": { "node": ">=18.0.0" }
 }
