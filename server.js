@@ -1,70 +1,46 @@
 const express = require('express');
+const app     = express();
 
-const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
 
+// ─────────────────────────────────────────────
+//  CONFIGURATION
+// ─────────────────────────────────────────────
 const SECRET_KEY  = process.env.SECRET_KEY  || '0241';
 const LOGIN_PASS  = process.env.LOGIN_PASS  || 'admin123';
 const PORT        = process.env.PORT        || 3000;
 const PHP_API_URL = process.env.PHP_API_URL || 'https://lld.zf3r.com/sms_queue_api.php';
 const PHP_API_KEY = process.env.PHP_API_KEY || '0241';
+const SELF_URL    = process.env.SELF_URL    || 'https://sms-railway.onrender.com';
 
 // ─────────────────────────────────────────────
-//  PHP API HELPER
-//  Mimics a real browser so shared hosting doesn't block the request
+//  PHP API BRIDGE  (fetch replaces lowdb)
 // ─────────────────────────────────────────────
-async function phpApi(action, extra = {}) {
-  const params = new URLSearchParams({ key: PHP_API_KEY, action, ...extra });
-  const url    = `${PHP_API_URL}?${params}`;
-
-  const res = await fetch(url, {
-    method : 'GET',
-    headers: {
-      'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-      'Accept'         : 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer'        : 'https://lld.zf3r.com/',
-      'Origin'         : 'https://lld.zf3r.com',
-    },
-    signal: AbortSignal.timeout(20000),
-  });
-
-  const text = await res.text();
-
-  // If response is HTML (hosting returned error page), throw clear error
-  if (text.trim().startsWith('<')) {
-    console.error(`PHP API returned HTML for action=${action}:`, text.substring(0, 300));
-    throw new Error('PHP API returned HTML instead of JSON — hosting may be blocking the request');
+async function phpApi(params) {
+  const url = new URL(PHP_API_URL);
+  url.searchParams.set('key', PHP_API_KEY);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, v);
   }
-
-  return JSON.parse(text);
+  const res  = await fetch(url.toString(), { signal: AbortSignal.timeout(10000) });
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch (e) { return { error: 'PHP returned non-JSON: ' + text.slice(0, 200) }; }
 }
 
-// POST version for send action
-async function phpApiPost(body) {
-  const res = await fetch(PHP_API_URL, {
-    method : 'POST',
-    headers: {
-      'Content-Type'   : 'application/json',
-      'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-      'Accept'         : 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer'        : 'https://lld.zf3r.com/',
-      'Origin'         : 'https://lld.zf3r.com',
-    },
-    body  : JSON.stringify(body),
-    signal: AbortSignal.timeout(20000),
-  });
-
-  const text = await res.text();
-  if (text.trim().startsWith('<')) {
-    console.error('PHP API POST returned HTML:', text.substring(0, 300));
-    throw new Error('PHP API returned HTML instead of JSON');
+// ─────────────────────────────────────────────
+//  KEEP-ALIVE  — pings self every 10 min so
+//  Render free tier never sleeps
+// ─────────────────────────────────────────────
+setInterval(async () => {
+  try {
+    await fetch(SELF_URL + '/ping', { signal: AbortSignal.timeout(8000) });
+    console.log('[keep-alive] ping ok', new Date().toISOString());
+  } catch (e) {
+    console.log('[keep-alive] ping failed:', e.message);
   }
-  return JSON.parse(text);
-}
+}, 10 * 60 * 1000); // every 10 minutes
 
 // ─────────────────────────────────────────────
 //  CORS
@@ -72,69 +48,87 @@ async function phpApiPost(body) {
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  ANDROID APP  —  /sms_gateway.php
-//  action=pending  → fetch pending SMS from PHP → send to app
-//  action=update   → mark SMS sent/failed via PHP
-// ═══════════════════════════════════════════════════════════════
-async function handleGateway(req, res) {
+app.use(express.static('public'));
+
+// ─────────────────────────────────────────────
+//  PING  (keep-alive + health check)
+// ─────────────────────────────────────────────
+app.get('/ping', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// ═══════════════════════════════════════════════
+//  ANDROID APP API
+//  Android SMS Gateway App v7 calls this endpoint
+// ═══════════════════════════════════════════════
+
+// GET /sms_gateway.php?key=0241&action=pending
+// GET /sms_gateway.php?key=0241&action=update&id=5&status=sent
+// POST with no action → treated as pending
+app.all('/sms_gateway.php', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
 
-  const key    = req.query.key    || req.body?.key    || '';
-  const action = req.query.action || req.body?.action || 'pending';
-
+  // Read key from GET, POST body, or header
+  const key = req.query.key || req.body?.key || req.headers['x-api-key'] || '';
   if (key !== SECRET_KEY) {
-    return res.json({ status: 'error', message: 'Invalid secret key' });
+    return res.status(401).json({ status: 'error', message: 'Invalid secret key' });
   }
 
-  try {
-    // ── fetch pending ──
-    if (action === 'pending') {
-      const data = await phpApi('pending');
-      if (data.status !== 'ok') {
-        return res.json({ status: 'error', message: data.error || 'PHP API error' });
+  const action = (req.query.action || req.body?.action || 'pending').trim();
+
+  // ── GET PENDING SMS from PHP/MySQL ─────────
+  if (action === 'pending') {
+    try {
+      const data = await phpApi({ action: 'pending' });
+      if (data.error) {
+        return res.json({ status: 'error', message: data.error, messages: [] });
       }
-      // PHP returns { sms:[{id,phone,message}] }
-      // Android app v7 expects { messages:[{id,to,text}] }
-      const messages = (data.sms || []).map(r => ({
-        id  : String(r.id),
-        to  : r.phone,
-        text: r.message,
+      // PHP returns { sms: [{id, phone, message}] }
+      // Android App v7 expects { status:'ok', messages:[{id, to, text}] }
+      const messages = (data.sms || data.messages || []).map(m => ({
+        id:   String(m.id),
+        to:   m.phone || m.to || '',
+        text: m.message || m.text || ''
       }));
       return res.json({ status: 'ok', messages });
+    } catch (e) {
+      return res.json({ status: 'error', message: e.message, messages: [] });
     }
-
-    // ── update status ──
-    if (action === 'update') {
-      const id     = req.query.id     || req.body?.id     || '';
-      const status = req.query.status || req.body?.status || 'sent';
-      const reason = req.query.reason || req.body?.reason || '';
-
-      if (!id) return res.json({ status: 'error', message: 'Missing id' });
-
-      const phpAction = status === 'failed' ? 'mark_failed' : 'mark_sent';
-      const extra     = status === 'failed' ? { id, reason } : { id };
-      const data      = await phpApi(phpAction, extra);
-      return res.json({ status: 'ok', updated: id, php: data });
-    }
-
-    return res.json({ status: 'error', message: 'Unknown action' });
-
-  } catch (err) {
-    console.error('Gateway error:', err.message);
-    return res.json({ status: 'error', message: err.message });
   }
-}
 
-app.get('/sms_gateway.php',  handleGateway);
-app.post('/sms_gateway.php', handleGateway);
+  // ── UPDATE STATUS (sent / failed) ──────────
+  if (action === 'update') {
+    const id     = req.query.id     || req.body?.id     || '';
+    const status = req.query.status || req.body?.status || 'sent';
+    const reason = req.query.reason || req.body?.reason || '';
 
-// ═══════════════════════════════════════════════════════════════
-//  DASHBOARD API
-// ═══════════════════════════════════════════════════════════════
+    if (!id) return res.json({ status: 'error', message: 'Missing id' });
+
+    try {
+      let phpAction = status === 'failed' ? 'mark_failed' : 'mark_sent';
+      const params  = { action: phpAction, id };
+      if (status === 'failed' && reason) params.reason = reason;
+
+      const data = await phpApi(params);
+      return res.json({ status: 'ok', updated: id, php: data });
+    } catch (e) {
+      return res.json({ status: 'error', message: e.message });
+    }
+  }
+
+  return res.json({ status: 'error', message: 'Unknown action' });
+});
+
+// ═══════════════════════════════════════════════
+//  WEB DASHBOARD API
+// ═══════════════════════════════════════════════
+
+// Login
 app.post('/api/login', (req, res) => {
   const { password } = req.body;
   res.json(password === LOGIN_PASS
@@ -142,71 +136,115 @@ app.post('/api/login', (req, res) => {
     : { status: 'error', message: 'Wrong password' });
 });
 
+// Stats — reads from PHP/MySQL
 app.get('/api/stats', async (req, res) => {
-  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error', message: 'Unauthorized' });
   try {
-    const data = await phpApi('stats');
+    const data = await phpApi({ action: 'stats' });
+    if (data.error) return res.json({ status: 'error', message: data.error });
     const s = data.stats || {};
-    res.json({ status: 'ok', ...s, total: (s.pending||0)+(s.sent||0)+(s.failed||0) });
-  } catch (err) { res.json({ status: 'error', message: err.message }); }
+    res.json({
+      status:  'ok',
+      total:   (s.pending || 0) + (s.sent || 0) + (s.failed || 0),
+      pending: s.pending || 0,
+      sent:    s.sent    || 0,
+      failed:  s.failed  || 0
+    });
+  } catch (e) {
+    res.json({ status: 'error', message: e.message });
+  }
 });
 
+// Send — queues in PHP/MySQL
 app.post('/api/send', async (req, res) => {
   const { key, phone, message } = req.body;
   if (key !== SECRET_KEY) return res.json({ status: 'error', message: 'Invalid key' });
   if (!phone || !message)  return res.json({ status: 'error', message: 'Fill all fields' });
   try {
-    const data = await phpApiPost({ key: PHP_API_KEY, action: 'send', phone, message });
-    res.json(data);
-  } catch (err) { res.json({ status: 'error', message: err.message }); }
-});
-
-app.get('/api/history', async (req, res) => {
-  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
-  try {
-    const data = await phpApi('log', { limit: 100 });
-    res.json({ status: 'ok', messages: (data.log || []).map(r => ({
-      id: r.id, phone_to: r.phone, message: r.message,
-      status: r.status, fail_reason: r.fail_reason,
-      created_at: r.created_at, sent_at: r.sent_at,
-    })), total: data.count || 0 });
-  } catch (err) { res.json({ status: 'error', message: err.message }); }
-});
-
-app.get('/api/delete', async (req, res) => {
-  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error' });
-  try {
-    res.json(await phpApi('delete', { id: req.query.id || 'all' }));
-  } catch (err) { res.json({ status: 'error', message: err.message }); }
-});
-
-// ── Health check — also shows raw PHP response for debugging ──
-app.get('/health', async (req, res) => {
-  try {
-    const data = await phpApi('ping');
-    res.json({ status: 'ok', php_api: data });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    const data = await phpApi({ action: 'send', phone, message });
+    if (data.error) return res.json({ status: 'error', message: data.error });
+    res.json({ status: 'ok', id: data.id });
+  } catch (e) {
+    res.json({ status: 'error', message: e.message });
   }
 });
 
-// ── Debug endpoint — shows raw text from PHP API ──
-app.get('/debug', async (req, res) => {
+// History — reads sent/failed log from PHP/MySQL
+app.get('/api/history', async (req, res) => {
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error', message: 'Unauthorized' });
+  const filter = req.query.filter || 'all';
+  const page   = parseInt(req.query.page || 1);
+  const limit  = 20;
+
   try {
-    const params = new URLSearchParams({ key: PHP_API_KEY, action: 'ping' });
-    const response = await fetch(`${PHP_API_URL}?${params}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept'    : 'application/json, */*',
-        'Referer'   : 'https://lld.zf3r.com/',
-      },
-      signal: AbortSignal.timeout(20000),
-    });
-    const text = await response.text();
-    res.setHeader('Content-Type', 'text/plain');
-    res.send(`HTTP Status: ${response.status}\n\nResponse Headers:\n${JSON.stringify(Object.fromEntries(response.headers), null, 2)}\n\nBody:\n${text}`);
-  } catch (err) {
-    res.send(`Fetch error: ${err.message}`);
+    // Fetch all from PHP log (sent+failed) + pending separately
+    let rows = [];
+
+    if (filter === 'pending' || filter === 'all') {
+      const pd = await phpApi({ action: 'pending' });
+      const pendingRows = (pd.sms || []).map(m => ({
+        id:       m.id,
+        phone_to: m.phone,
+        message:  m.message,
+        status:   'pending',
+        created:  m.created_at || '',
+        sent_at:  null
+      }));
+      rows = rows.concat(pendingRows);
+    }
+
+    if (filter !== 'pending') {
+      const logLimit = 500;
+      const ld = await phpApi({ action: 'log', limit: logLimit });
+      let logRows = (ld.log || []).map(m => ({
+        id:       m.id,
+        phone_to: m.phone,
+        message:  m.message,
+        status:   m.status,
+        created:  m.created_at || '',
+        sent_at:  m.sent_at || ''
+      }));
+      if (filter !== 'all') logRows = logRows.filter(m => m.status === filter);
+      rows = rows.concat(logRows);
+    }
+
+    // Sort by id descending (newest first)
+    rows.sort((a, b) => b.id - a.id);
+
+    const total = rows.length;
+    const paged = rows.slice((page - 1) * limit, page * limit);
+    res.json({ status: 'ok', messages: paged, total });
+  } catch (e) {
+    res.json({ status: 'error', message: e.message });
+  }
+});
+
+// Edit — update a pending record in PHP/MySQL
+app.post('/api/edit', async (req, res) => {
+  const { key, id, phone, message } = req.body;
+  if (key !== SECRET_KEY) return res.json({ status: 'error', message: 'Invalid key' });
+  if (!id || !phone || !message) return res.json({ status: 'error', message: 'Fill all fields' });
+
+  try {
+    // Delete the old record and re-insert (PHP API has no edit, but has send+delete)
+    await phpApi({ action: 'delete', id });
+    const data = await phpApi({ action: 'send', phone, message });
+    if (data.error) return res.json({ status: 'error', message: data.error });
+    res.json({ status: 'ok' });
+  } catch (e) {
+    res.json({ status: 'error', message: e.message });
+  }
+});
+
+// Delete
+app.get('/api/delete', async (req, res) => {
+  if (req.query.key !== SECRET_KEY) return res.json({ status: 'error', message: 'Unauthorized' });
+  const id = req.query.id || '';
+  try {
+    const data = await phpApi({ action: 'delete', id });
+    res.json({ status: 'ok', deleted: data.deleted || 0 });
+  } catch (e) {
+    res.json({ status: 'error', message: e.message });
   }
 });
 
@@ -214,6 +252,7 @@ app.get('/debug', async (req, res) => {
 //  START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`SMS Gateway running on port ${PORT}`);
+  console.log(`SMS Gateway Bridge running on port ${PORT}`);
   console.log(`PHP API: ${PHP_API_URL}`);
+  console.log(`Keep-alive target: ${SELF_URL}`);
 });
